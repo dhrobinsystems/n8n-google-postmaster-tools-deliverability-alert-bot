@@ -1,0 +1,1756 @@
+{
+  "name": "n8n-google-postmaster-tools-deliverability-alert-bot",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "17 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "b8fed0e8-d469-5a23-934f-0fb5dcc210b2",
+      "name": "Daily Deliverability Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Daily 07:17 in the workflow timezone (Settings → Timezone). Pinned fictional run with 7 domains."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Run Context                     Mode: Run Once for All Items\n// Repo: n8n-google-postmaster-tools-deliverability-alert-bot · dhRobin Systems\n// Decides which domains to check, the date window (Postmaster data lags a\n// day or two, so the window looks back LOOKBACK_DAYS) and the run mode.\n// Domains come from POSTMASTER_DOMAINS (least privilege, default) or, with\n// POSTMASTER_DISCOVER_DOMAINS=true, from GET /v2/domains.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nlet crypto = null; try { crypto = require('crypto'); } catch (e) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst LOOKBACK = Math.min(30, Math.max(3, num('LOOKBACK_DAYS', 8)));\nconst first = $input.first().json || {};\nconst fixtures = SANDBOX_MODE ? first.sandboxFixtures || null : null;\nconst domainOk = (d) => /^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(d);\nlet domains = csv('POSTMASTER_DOMAINS', '').map((d) => d.toLowerCase().replace(/^domains\\//, '')).filter((d) => domainOk(d) && !/^your_/i.test(d));\nif (SANDBOX_MODE && !domains.length && fixtures) domains = fixtures.domains.map((d) => d.name);\nconst today = fixtures && fixtures.today ? new Date(`${fixtures.today}T00:00:00Z`) : new Date();\nconst dayStart = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));\nconst d = (offset) => { const x = new Date(dayStart.getTime() - offset * 86400000); return { year: x.getUTCFullYear(), month: x.getUTCMonth() + 1, day: x.getUTCDate() }; };\nlet runId; try { runId = 'pm_' + crypto.randomUUID(); } catch (e) { runId = 'pm_' + Date.now().toString(36); }\nreturn [{ json: {\n  run: { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN, checkDate: dayStart.toISOString().slice(0, 10) },\n  window: { start: d(LOOKBACK), end: d(1), lookbackDays: LOOKBACK },\n  domains,\n  discover: !SANDBOX_MODE && flag('POSTMASTER_DISCOVER_DOMAINS', false),\n  sandboxFixtures: fixtures,\n} }];\n"
+      },
+      "id": "46b7c9b7-ca4c-57e9-ab10-278fdbf202da",
+      "name": "Build Run Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Domain list (env, or discovery) · lookback window · run mode."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b0158009-d992-595f-88f5-0ddfdd94e766",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "653b440e-6adf-5a50-bfb7-7b8c0c093939",
+      "name": "Sandbox Postmaster?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Postmaster API (Sandbox)     Mode: Run Once for All Items\n// Fictional domains in the exact v2 response shapes: QueryDomainStatsResponse\n// (domainStats[].{name, metric, date, value.doubleValue}) and\n// DomainComplianceStatus (complianceData.{rowData, deliverabilityStatusVerdict}).\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $input.first().json;\nconst fx = ctx.sandboxFixtures || { domains: [] };\nconst out = [];\nfor (const dom of fx.domains) {\n  if (dom.error) { out.push({ json: { domain: dom.name, simulated: { stats: { statusCode: dom.error, body: { error: { code: dom.error, status: 'PERMISSION_DENIED', message: 'The caller does not have permission' } } }, compliance: { statusCode: dom.error, body: {} } } } }); continue; }\n  const domainStats = [];\n  (dom.days || []).forEach((day, i) => {\n    const date = { year: Number(day.date.slice(0, 4)), month: Number(day.date.slice(5, 7)), day: Number(day.date.slice(8, 10)) };\n    for (const [metric, v] of Object.entries(day.metrics)) domainStats.push({ name: `domains/${dom.name}/domainStats/${day.date.replace(/-/g, '')}-${metric}`, metric, date, value: { doubleValue: v } });\n  });\n  out.push({ json: { domain: dom.name, simulated: {\n    stats: { statusCode: 200, body: { domainStats, nextPageToken: '' } },\n    compliance: dom.compliance ? { statusCode: 200, body: { name: `domains/${dom.name}/complianceStatus`, complianceData: dom.compliance } } : { statusCode: 404, body: {} },\n  } } });\n}\nreturn out;\n"
+      },
+      "id": "5afb940b-6606-538b-ad72-149c2afc4155",
+      "name": "Simulate Postmaster API (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://oauth2.googleapis.com/token",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "client_id",
+              "value": "={{ $env.GOOGLE_OAUTH_CLIENT_ID }}"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.GOOGLE_OAUTH_CLIENT_SECRET }}"
+            },
+            {
+              "name": "refresh_token",
+              "value": "={{ $env.GOOGLE_OAUTH_REFRESH_TOKEN }}"
+            },
+            {
+              "name": "grant_type",
+              "value": "refresh_token"
+            }
+          ]
+        }
+      },
+      "id": "3632443d-7866-5d77-b4d3-ae646b4bdc26",
+      "name": "Get Google Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        440
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "OAuth 2.0 refresh-token grant · scope postmaster.traffic.readonly (+ postmaster.domain only if discovery is on)."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ef46772f-60fd-5ae9-b8ba-decd275a312b",
+              "leftValue": "={{ $('Build Run Context').first().json.discover }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3524f5ac-0c0c-55f3-bdac-71b349193ca6",
+      "name": "Discover Domains?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.POSTMASTER_API_BASE_URL || 'https://gmailpostmastertools.googleapis.com' }}/v2/domains?pageSize=200{{ ($env.GOOGLE_POSTMASTER_API_KEY && !String($env.GOOGLE_POSTMASTER_API_KEY).startsWith('YOUR_')) ? '&key=' + encodeURIComponent($env.GOOGLE_POSTMASTER_API_KEY) : '' }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get Google Access Token').first().json.body.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "f79d331c-93e8-59ec-8fae-60965daa6e89",
+      "name": "List Postmaster Domains",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        540
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "GET /v2/domains · needs the postmaster.domain scope."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Domain Queries                  Mode: Run Once for All Items\n// One item per domain with its domainStats:query body. With discovery on,\n// verified domains from GET /v2/domains are added to the configured list.\n// Metrics (v2 StandardMetric, one query per domain, DAILY):\n//   spam_rate         SPAM_RATE\n//   auth_spf/dkim/dmarc AUTH_SUCCESS_RATE  auth_type = \"spf\" | \"dkim\" | \"dmarc\"\n//   tls_inbound       TLS_ENCRYPTION_RATE  traffic_direction = \"inbound\" (your mail into Gmail)\n//   err_total         DELIVERY_ERROR_RATE  (all types)\n//   err_rep_domain    DELIVERY_ERROR_RATE  reject · low_domain_reputation\n//   err_rep_ip        DELIVERY_ERROR_RATE  reject · low_ip_reputation\n//   err_temp          DELIVERY_ERROR_RATE  temp_fail\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst MAX = Math.max(1, num('MAX_DOMAINS_PER_RUN', 50));\nconst ctx = $('Build Run Context').first().json;\nconst domains = [...ctx.domains];\nconst discovery = { used: false, status: null, skipped: 0 };\nif (ctx.discover) {\n  let res = null; try { res = $('List Postmaster Domains').first().json; } catch (e) { res = null; }\n  discovery.used = true; discovery.status = res ? res.statusCode || null : null;\n  const list = res && Number(res.statusCode) === 200 && res.body && Array.isArray(res.body.domains) ? res.body.domains : [];\n  for (const x of list) {\n    const name = String(x.name || '').replace(/^domains\\//, '').toLowerCase();\n    if (!name) continue;\n    if (x.verificationState && !/^VERIFIED/.test(String(x.verificationState))) { discovery.skipped++; continue; }\n    if (!domains.includes(name)) domains.push(name);\n  }\n}\nconst m = (name, standardMetric, filter) => ({ name, baseMetric: { standardMetric }, ...(filter ? { filter } : {}) });\nconst metricDefinitions = [\n  m('spam_rate', 'SPAM_RATE'),\n  m('auth_spf', 'AUTH_SUCCESS_RATE', 'auth_type = \"spf\"'),\n  m('auth_dkim', 'AUTH_SUCCESS_RATE', 'auth_type = \"dkim\"'),\n  m('auth_dmarc', 'AUTH_SUCCESS_RATE', 'auth_type = \"dmarc\"'),\n  m('tls_inbound', 'TLS_ENCRYPTION_RATE', 'traffic_direction = \"inbound\"'),\n  m('err_total', 'DELIVERY_ERROR_RATE'),\n  m('err_rep_domain', 'DELIVERY_ERROR_RATE', 'error_type = \"reject\" AND error_reason = \"low_domain_reputation\"'),\n  m('err_rep_ip', 'DELIVERY_ERROR_RATE', 'error_type = \"reject\" AND error_reason = \"low_ip_reputation\"'),\n  m('err_temp', 'DELIVERY_ERROR_RATE', 'error_type = \"temp_fail\"'),\n];\nif (!domains.length) return [{ json: { domain: null, skip: true, discovery, reason: ctx.discover ? 'no verified domains returned by GET /v2/domains' : 'POSTMASTER_DOMAINS is empty' } }];\nreturn domains.slice(0, MAX).map((domain) => ({ json: { domain, path: encodeURIComponent(domain), discovery,\n  query: { metricDefinitions, timeQuery: { dateRanges: { dateRanges: [{ start: ctx.window.start, end: ctx.window.end }] } }, aggregationGranularity: 'DAILY', pageSize: 200 } } }));\n"
+      },
+      "id": "dbddf04a-acad-57aa-b380-c3846d5a2118",
+      "name": "Build Domain Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        440
+      ],
+      "notes": "One domainStats:query per domain · 9 metric definitions · DAILY over the window."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a6eeaa01-47a1-56ee-9f02-71c17491fc5b",
+              "leftValue": "={{ !!$json.domain }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "81aba6b0-c44c-53c0-9e95-1fdabfcae0e6",
+      "name": "Domains to Check?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.POSTMASTER_API_BASE_URL || 'https://gmailpostmastertools.googleapis.com' }}/v2/domains/{{ $json.path }}/domainStats:query{{ ($env.GOOGLE_POSTMASTER_API_KEY && !String($env.GOOGLE_POSTMASTER_API_KEY).startsWith('YOUR_')) ? '?key=' + encodeURIComponent($env.GOOGLE_POSTMASTER_API_KEY) : '' }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get Google Access Token').first().json.body.access_token }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.query) }}"
+      },
+      "id": "5262bc8e-23f3-5361-b6a9-9785ed5e5f70",
+      "name": "Query Domain Stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "POST /v2/{parent=domains/*}/domainStats:query."
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.POSTMASTER_API_BASE_URL || 'https://gmailpostmastertools.googleapis.com' }}/v2/domains/{{ $('Build Domain Queries').item.json.path }}/complianceStatus{{ ($env.GOOGLE_POSTMASTER_API_KEY && !String($env.GOOGLE_POSTMASTER_API_KEY).startsWith('YOUR_')) ? '?key=' + encodeURIComponent($env.GOOGLE_POSTMASTER_API_KEY) : '' }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Get Google Access Token').first().json.body.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "3630fe12-8d62-5acb-8134-fbbeaa09c471",
+      "name": "Get Compliance Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        380
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notes": "GET /v2/{name=domains/*/complianceStatus} · sender requirements + deliverability verdict."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Domain Health & Alert Evaluator       Mode: Run Once for All Items\n// Google retired Domain and IP Reputation in Postmaster Tools v2, so I grade\n// each domain HIGH / MEDIUM / LOW / BAD from the signals v2 still exposes:\n//   spam rate (latest day + spike vs. baseline) · reputation-driven rejects\n//   (low_domain_reputation, low_ip_reputation) · SPF/DKIM/DMARC success ·\n//   inbound TLS encryption rate · total delivery errors · compliance status.\n// The worst rule wins. Alerts fire on drops into MEDIUM/LOW/BAD, spam spikes,\n// repeats while degraded (REPEAT_ALERT_DAYS), recoveries and API errors.\n// Builds one Slack Block Kit message for the whole run.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst T = {\n  spamWarn: num('SPAM_RATE_WARN', 0.001), spamCrit: num('SPAM_RATE_CRITICAL', 0.003), spamSevere: num('SPAM_RATE_SEVERE', 0.006),\n  spikeMult: num('SPAM_SPIKE_MULTIPLIER', 2), spikeMin: num('SPAM_SPIKE_MIN_RATE', 0.0005),\n  repWarn: num('REPUTATION_REJECT_WARN', 0), repCrit: num('REPUTATION_REJECT_CRITICAL', 0.01), repSevere: num('REPUTATION_REJECT_SEVERE', 0.05),\n  authMin: num('AUTH_SUCCESS_MIN', 0.98), tlsMin: num('TLS_ENCRYPTION_MIN', 0.99), tlsCrit: num('TLS_ENCRYPTION_CRITICAL', 0.9),\n  errWarn: num('DELIVERY_ERROR_WARN', 0.02), errCrit: num('DELIVERY_ERROR_CRITICAL', 0.1),\n};\nconst REPEAT_DAYS = Math.max(1, num('REPEAT_ALERT_DAYS', 3));\nconst RECOVERY = flag('NOTIFY_ON_RECOVERY', true);\nconst ALERT_NO_DATA = flag('ALERT_ON_NO_DATA', false);\nconst MASK_SLACK = flag('SLACK_MASK_DOMAINS', false);\nconst MENTION = env('SLACK_MENTION_ON_LOW', '');\nconst MAX_IN_MESSAGE = 10;\nconst RANK = { HIGH: 0, MEDIUM: 1, LOW: 2, BAD: 3 };\n\nconst ctx = $('Build Run Context').first().json;\nconst items = $input.all();\nconst sandbox = !!(items[0] && items[0].json.simulated);\nlet pairs;\nlet configError = null;\nif (sandbox) pairs = items.map((i) => ({ domain: i.json.domain, stats: i.json.simulated.stats, compliance: i.json.simulated.compliance }));\nelse {\n  const queries = $('Build Domain Queries').all();\n  let stats = [];\n  try { stats = $('Query Domain Stats').all(); } catch (e) { stats = []; }\n  if (queries[0] && queries[0].json.skip) { configError = queries[0].json.reason; pairs = []; }\n  else pairs = queries.map((q, i) => ({ domain: q.json.domain, stats: stats[i] ? stats[i].json : null, compliance: items[i] ? items[i].json : null }));\n}\nlet state = {};\nif (sandbox) state = (ctx.sandboxFixtures && ctx.sandboxFixtures.previousState) || {};\nelse { try { state = JSON.parse(JSON.stringify($getWorkflowStaticData('global').postmasterState || {})); } catch (e) { state = {}; } }\n\nconst rate = (v) => { if (!v) return null; let n = v.doubleValue ?? v.floatValue ?? (v.intValue !== undefined ? Number(v.intValue) : null); n = Number(n); if (!Number.isFinite(n)) return null; return n > 1 ? n / 100 : n; };\nconst iso = (d) => (d ? `${d.year}-${String(d.month).padStart(2, '0')}-${String(d.day).padStart(2, '0')}` : null);\nconst pct = (v, dp = 2) => (v === null || v === undefined ? 'n/a' : `${(v * 100).toFixed(dp)}%`);\nconst worst = (a, b) => (RANK[b] > RANK[a] ? b : a);\n\nfunction evaluate(p) {\n  const e = { domain: p.domain, grade: 'HIGH', status: 'ok', dataDate: null, metrics: {}, baseline: {}, findings: [], compliance: null, errors: [] };\n  const sc = p.stats ? Number(p.stats.statusCode) : 0;\n  if (sc !== 200) {\n    e.status = 'error'; e.grade = null;\n    const msg = p.stats && p.stats.body && p.stats.body.error ? `${p.stats.body.error.status || ''} ${p.stats.body.error.message || ''}`.trim() : 'no response';\n    e.errors.push(`domainStats:query HTTP ${sc || 'n/a'} ${msg}`.slice(0, 200));\n    return e;\n  }\n  const byDate = {};\n  for (const s of (p.stats.body && p.stats.body.domainStats) || []) { const d = iso(s.date); if (!d) continue; (byDate[d] = byDate[d] || {})[s.metric] = rate(s.value); }\n  const dates = Object.keys(byDate).sort();\n  if (!dates.length) { e.status = 'no_data'; e.grade = null; return e; }\n  const latest = dates[dates.length - 1];\n  e.dataDate = latest; e.metrics = byDate[latest]; e.daysWithData = dates.length;\n  const prior = dates.slice(0, -1).map((d) => byDate[d].spam_rate).filter((v) => v !== null && v !== undefined);\n  e.baseline.spamRate = prior.length >= 3 ? prior.reduce((a, b) => a + b, 0) / prior.length : null;\n  const m = e.metrics;\n  const add = (grade, kind, message, value, threshold) => { e.grade = worst(e.grade, grade); e.findings.push({ grade, kind, message, value, threshold }); };\n\n  if (m.spam_rate != null) {\n    if (m.spam_rate >= T.spamSevere) add('BAD', 'spam_rate', `Spam rate ${pct(m.spam_rate)} is far above Google's 0.30% limit`, m.spam_rate, T.spamSevere);\n    else if (m.spam_rate >= T.spamCrit) add('LOW', 'spam_rate', `Spam rate ${pct(m.spam_rate)} at or above ${pct(T.spamCrit)}`, m.spam_rate, T.spamCrit);\n    else if (m.spam_rate >= T.spamWarn) add('MEDIUM', 'spam_rate', `Spam rate ${pct(m.spam_rate)} above the ${pct(T.spamWarn)} target`, m.spam_rate, T.spamWarn);\n    if (e.baseline.spamRate !== null && m.spam_rate >= Math.max(T.spikeMin, T.spikeMult * e.baseline.spamRate)) {\n      e.spamSpike = true;\n      add(m.spam_rate >= T.spamWarn ? 'MEDIUM' : 'HIGH', 'spam_spike', `Spam spike: ${pct(m.spam_rate)} vs ${pct(e.baseline.spamRate)} average over the prior ${prior.length} days`, m.spam_rate, T.spikeMult * e.baseline.spamRate);\n    }\n  }\n  for (const [k, label] of [['err_rep_domain', 'low domain reputation'], ['err_rep_ip', 'low IP reputation']]) {\n    const v = m[k];\n    if (v == null || v <= T.repWarn) continue;\n    add(v >= T.repSevere ? 'BAD' : v >= T.repCrit ? 'LOW' : 'MEDIUM', k, `Gmail rejected ${pct(v)} of mail for ${label}`, v, v >= T.repSevere ? T.repSevere : v >= T.repCrit ? T.repCrit : T.repWarn);\n  }\n  for (const [k, label] of [['auth_spf', 'SPF'], ['auth_dkim', 'DKIM'], ['auth_dmarc', 'DMARC']]) if (m[k] != null && m[k] < T.authMin) add('MEDIUM', k, `${label} success ${pct(m[k], 1)} below ${pct(T.authMin, 0)}`, m[k], T.authMin);\n  if (m.tls_inbound != null && m.tls_inbound < T.tlsMin) add(m.tls_inbound < T.tlsCrit ? 'LOW' : 'MEDIUM', 'tls', `TLS encryption ${pct(m.tls_inbound, 1)} below ${pct(T.tlsMin, 0)} (unencrypted delivery to Gmail)`, m.tls_inbound, T.tlsMin);\n  if (m.err_total != null && m.err_total >= T.errWarn) add(m.err_total >= T.errCrit ? 'LOW' : 'MEDIUM', 'delivery_errors', `Delivery errors ${pct(m.err_total, 1)} of traffic${m.err_temp ? ` (temp-fail ${pct(m.err_temp, 1)})` : ''}`, m.err_total, T.errWarn);\n\n  const c = p.compliance && Number(p.compliance.statusCode) === 200 && p.compliance.body ? p.compliance.body.complianceData : null;\n  if (c) {\n    const needs = (c.rowData || []).filter((r) => r.status && r.status.status === 'NEEDS_WORK').map((r) => String(r.requirement || 'requirement').replace(/_/g, ' ').toLowerCase());\n    const verdict = c.deliverabilityStatusVerdict && c.deliverabilityStatusVerdict.state ? c.deliverabilityStatusVerdict.state.status : null;\n    e.compliance = { needsWork: needs, deliverability: verdict, reason: c.deliverabilityStatusVerdict ? c.deliverabilityStatusVerdict.reason || null : null };\n    if (needs.length) add('MEDIUM', 'compliance', `Sender requirements need work: ${needs.join(', ')}`, needs.length, 0);\n    if (verdict === 'NEEDS_WORK') add('MEDIUM', 'deliverability_verdict', `Deliverability verdict: needs work${e.compliance.reason ? ` (${String(e.compliance.reason).replace(/_/g, ' ').toLowerCase()})` : ''}`, null, null);\n  } else if (p.compliance && Number(p.compliance.statusCode) !== 404) e.errors.push(`complianceStatus HTTP ${p.compliance.statusCode || 'n/a'}`);\n  return e;\n}\n\n// Sandbox runs use the fixture date, so the repeat/recovery rules behave the same whenever you test.\nconst nowMs = sandbox && ctx.sandboxFixtures && ctx.sandboxFixtures.today ? Date.parse(`${ctx.sandboxFixtures.today}T07:17:00Z`) : Date.now();\nconst evaluations = pairs.map(evaluate);\nconst alerts = [];\nconst nextState = { ...state };\nfor (const e of evaluations) {\n  const prev = state[e.domain] || null;\n  let reason = null;\n  const newSpike = !prev || prev.spikeDataDate !== e.dataDate; // one spike alert per data day\n  if (e.status === 'error') reason = 'api_error';\n  else if (e.status === 'no_data') reason = ALERT_NO_DATA && prev && prev.grade ? 'no_data' : null;\n  else if (RANK[e.grade] >= 1) {\n    const prevRank = prev && prev.grade && RANK[prev.grade] !== undefined ? RANK[prev.grade] : -1;\n    if (RANK[e.grade] > prevRank) reason = prev && prev.grade ? 'degraded' : 'degraded_first_check';\n    else if (e.spamSpike && newSpike) reason = 'spam_spike';\n    else if (!prev || !prev.lastAlertAt || nowMs - Date.parse(prev.lastAlertAt) >= REPEAT_DAYS * 86400000) reason = 'still_degraded';\n  } else if (e.spamSpike && newSpike) reason = 'spam_spike';\n  else if (RECOVERY && prev && prev.grade && RANK[prev.grade] >= 1) reason = 'recovered';\n  e.previousGrade = prev ? prev.grade || null : null;\n  e.alertReason = reason;\n  if (reason) alerts.push(e);\n  nextState[e.domain] = { grade: e.status === 'ok' ? e.grade : prev ? prev.grade : null, checkedAt: new Date(nowMs).toISOString(), dataDate: e.dataDate || (prev && prev.dataDate) || null,\n    lastAlertAt: reason ? new Date(nowMs).toISOString() : prev ? prev.lastAlertAt || null : null,\n    spikeDataDate: e.spamSpike ? e.dataDate : prev ? prev.spikeDataDate || null : null };\n}\n\n// ── Slack Block Kit ───────────────────────────────────────────────────\nconst esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst show = (d) => (MASK_SLACK ? d.replace(/^([^.]{1,2})[^.]*/, '$1•••') : d);\nconst EMOJI = { HIGH: '🟢', MEDIUM: '🟡', LOW: '🟠', BAD: '🔴' };\nconst ACTION = {\n  spam_rate: 'Pause cold or low-engagement segments, check list sources, keep complaints under 0.10%.',\n  spam_spike: 'Find the campaign or segment sent on the spike day and stop it; review recent list imports.',\n  err_rep_domain: 'Gmail is rejecting on domain reputation: cut volume, send only to engaged recipients, warm back up slowly.',\n  err_rep_ip: 'Gmail is rejecting on IP reputation: check your ESP pool or dedicated IP, slow down, check blocklists.',\n  auth_spf: 'Check SPF includes for every sending service.', auth_dkim: 'Check DKIM signing and key rotation at every sending service.',\n  auth_dmarc: 'Check DMARC alignment of the From domain with SPF/DKIM.', tls: 'Make sure every sending MTA uses TLS to Gmail.',\n  delivery_errors: 'Open Postmaster Tools → Delivery errors for the reasons.', compliance: 'Fix the sender requirements listed in Compliance status.',\n  deliverability_verdict: 'Review the Deliverability analysis in Postmaster Tools.',\n};\nif (configError) alerts.push({ domain: '(configuration)', alertReason: 'api_error', errors: [configError], findings: [], metrics: {}, baseline: {} });\nconst degraded = alerts.filter((a) => a.alertReason !== 'recovered' && a.alertReason !== 'api_error');\nconst recovered = alerts.filter((a) => a.alertReason === 'recovered');\nconst errored = alerts.filter((a) => a.alertReason === 'api_error');\nlet slackMessage = null;\nif (alerts.length) {\n  const worstGrade = degraded.reduce((g, a) => (a.grade ? worst(g, a.grade) : g), 'HIGH');\n  const title = degraded.length ? `${EMOJI[worstGrade]} Gmail deliverability: ${degraded.length} domain${degraded.length === 1 ? '' : 's'} need attention` : recovered.length ? '🟢 Gmail deliverability recovered' : '⚠️ Postmaster Tools check failed';\n  const blocks = [{ type: 'header', text: { type: 'plain_text', text: title.slice(0, 150), emoji: true } }];\n  if (MENTION && degraded.some((a) => RANK[a.grade] >= 2)) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${MENTION} a domain is at LOW or BAD` } });\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Check ${esc(ctx.run.checkDate)} · data through ${esc(evaluations.map((x) => x.dataDate).filter(Boolean).sort().pop() || 'n/a')} · ${evaluations.length} domains checked · mode ${esc(ctx.run.mode)}` }] });\n  for (const a of degraded.slice(0, MAX_IN_MESSAGE)) {\n    const m = a.metrics;\n    const why = { degraded: `dropped ${a.previousGrade} → *${a.grade}*`, degraded_first_check: `*${a.grade}* on first check`, spam_spike: `spam spike (still *${a.grade}*)`, still_degraded: `still *${a.grade}*`, no_data: 'no data today' }[a.alertReason] || a.alertReason;\n    blocks.push({ type: 'divider' });\n    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${EMOJI[a.grade] || '⚪'} *${esc(show(a.domain))}*: ${why} · data ${esc(a.dataDate || 'n/a')}` },\n      fields: [\n        { type: 'mrkdwn', text: `*Spam rate*\\n${pct(m.spam_rate)}${a.baseline.spamRate !== null && a.baseline.spamRate !== undefined ? ` (avg ${pct(a.baseline.spamRate)})` : ''}` },\n        { type: 'mrkdwn', text: `*Reputation rejects*\\ndomain ${pct(m.err_rep_domain)} · IP ${pct(m.err_rep_ip)}` },\n        { type: 'mrkdwn', text: `*Auth (SPF/DKIM/DMARC)*\\n${pct(m.auth_spf, 1)} / ${pct(m.auth_dkim, 1)} / ${pct(m.auth_dmarc, 1)}` },\n        { type: 'mrkdwn', text: `*TLS · delivery errors*\\n${pct(m.tls_inbound, 1)} · ${pct(m.err_total, 1)}` },\n      ] });\n    const lines = a.findings.filter((f) => f.grade !== 'HIGH' || f.kind === 'spam_spike').map((f) => `• ${esc(f.message)}`);\n    const acts = [...new Set(a.findings.map((f) => ACTION[f.kind]).filter(Boolean))].slice(0, 3).map((t) => `→ ${esc(t)}`);\n    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: [...lines, ...acts].join('\\n').slice(0, 2900) || '• see Postmaster Tools' } });\n  }\n  if (degraded.length > MAX_IN_MESSAGE) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `…and ${degraded.length - MAX_IN_MESSAGE} more domains (see the audit log)` }] });\n  if (recovered.length) { blocks.push({ type: 'divider' }); blocks.push({ type: 'section', text: { type: 'mrkdwn', text: recovered.map((a) => `🟢 *${esc(show(a.domain))}* recovered: ${esc(a.previousGrade)} → HIGH`).join('\\n') } }); }\n  if (errored.length) { blocks.push({ type: 'divider' }); blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `⚠️ *Couldn't check:*\\n${errored.map((a) => `• ${esc(show(a.domain))}: ${esc(a.errors[0] || 'error')}`).join('\\n')}`.slice(0, 2900) } }); }\n  blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Open Postmaster Tools', emoji: true }, url: 'https://postmaster.google.com/', ...(RANK[worstGrade] >= 2 ? { style: 'danger' } : {}) }] });\n  blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Health grade is derived by this bot (Google retired Domain/IP Reputation in Postmaster Tools v2): spam rate, reputation-driven rejects, authentication, TLS and compliance. Gmail data only.' }] });\n  slackMessage = { text: title, blocks: blocks.slice(0, 50) };\n}\nconst slackDelivery = !alerts.length ? 'none' : SANDBOX_MODE || DRY_RUN ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\nreturn [{ json: { run: ctx.run, window: ctx.window, evaluations, alertCount: alerts.length, summary: { checked: evaluations.length, high: evaluations.filter((e) => e.grade === 'HIGH').length,\n  medium: evaluations.filter((e) => e.grade === 'MEDIUM').length, low: evaluations.filter((e) => e.grade === 'LOW').length, bad: evaluations.filter((e) => e.grade === 'BAD').length,\n  noData: evaluations.filter((e) => e.status === 'no_data').length, errors: evaluations.filter((e) => e.status === 'error').length }, nextState, slackDelivery, slackMessage } }];\n"
+      },
+      "id": "622988ec-5b25-5d16-953b-abbfc38c215f",
+      "name": "Domain Health & Alert Evaluator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        300
+      ],
+      "notes": "Derived HIGH/MEDIUM/LOW/BAD grade · spam spikes · repeat & recovery rules · Block Kit."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "77a24b9d-ec9a-5033-9f2e-4610fc4dbaeb",
+              "leftValue": "={{ $json.slackDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6a78807d-efd6-54f7-87f8-8ea469ab84f5",
+      "name": "Post Slack Alert?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "914ea172-7886-5b6a-9d8f-92016ba221ee",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        200
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery                Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Post Slack Alert?').item.json;\nreturn { json: { ...ctx, slackResult: { simulated: false, mode: 'live', ok: true, at: new Date().toISOString() } } };\n"
+      },
+      "id": "0a7eb047-08be-5d04-a560-42481da9e084",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                  Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['GOOGLE_OAUTH_CLIENT_SECRET', 'GOOGLE_OAUTH_REFRESH_TOKEN', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_POSTMASTER_API_KEY', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nconst ctx = $('Post Slack Alert?').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\nreturn { json: { ...ctx, slackResult: { simulated: false, mode: 'live', ok: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300) } } };\n"
+      },
+      "id": "4f86668f-5c5e-524d-b0c2-b70b59e870eb",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Slack Alert (Dry Run)        Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn { json: { ...item, slackResult: { simulated: true, mode: item.slackDelivery, blockCount: item.slackMessage ? item.slackMessage.blocks.length : 0,\n  note: item.slackDelivery === 'not_configured' ? 'SLACK_WEBHOOK_URL not set: alert not posted' : item.slackDelivery === 'dry_run' ? 'dry run: Block Kit built, not posted' : 'no alert needed' } } };\n"
+      },
+      "id": "432c2456-76b5-576e-86c8-762625927ec3",
+      "name": "Simulate Slack Alert (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Domain State                   Mode: Run Once for Each Item\n// Stores each domain's grade and last alert time for tomorrow's comparison.\n// Live only, and only when no alert was needed or Slack accepted it, so a\n// failed post is retried by the next run.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst item = $json;\nconst live = !item.run.sandboxMode && !item.run.dryRun;\nconst delivered = item.alertCount === 0 || (item.slackResult && item.slackResult.ok === true && !item.slackResult.simulated);\nlet stored = false;\nif (live && delivered) {\n  try { const s = $getWorkflowStaticData('global'); s.postmasterState = item.nextState; s.postmasterLastRun = { at: new Date().toISOString(), runId: item.run.runId }; stored = true; } catch (e) { stored = false; }\n}\nreturn { json: { ...item, slackMessage: undefined, stateStored: stored, stateHeldReason: stored ? null : !live ? `${item.run.mode} mode` : 'Slack delivery failed or not configured; tomorrow re-alerts' } };\n"
+      },
+      "id": "f182d8b1-d610-5788-a9a1-b06720296a7a",
+      "name": "Record Domain State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        300
+      ],
+      "notes": "Live only · after successful delivery (or when no alert was due)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                          Mode: Run Once for All Items\n// One run record plus one record per domain: grades, metric values, finding\n// kinds and alert reasons. Domain names are masked unless\n// AUDIT_MASK_DOMAINS=false; no tokens, URLs or raw API bodies are logged.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['GOOGLE_OAUTH_CLIENT_SECRET', 'GOOGLE_OAUTH_REFRESH_TOKEN', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_POSTMASTER_API_KEY', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\nlet crypto = null; try { crypto = require('crypto'); } catch (e) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst MASK = flag('AUDIT_MASK_DOMAINS', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 400));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\nconst label = (d) => { if (!MASK) return d; const tld = String(d).split('.').pop(); const h = crypto ? crypto.createHash('sha256').update(String(d)).digest('hex').slice(0, 10) : 'masked'; return `dom_${h}.${tld}`; };\nconst round = (v) => (v === null || v === undefined ? null : Math.round(v * 100000) / 100000);\nconst out = [];\nfor (const { json: item } of $input.all()) {\n  out.push({ json: redact({ auditVersion: 1, at: new Date().toISOString(), workflowId: $workflow.id || null, executionId: $execution.id || null, runId: item.run.runId, mode: item.run.mode,\n    record: 'run', checkDate: item.run.checkDate, summary: item.summary, alertCount: item.alertCount, slack: item.slackResult || null, stateStored: item.stateStored, stateHeldReason: item.stateHeldReason }) });\n  for (const e of item.evaluations || []) {\n    out.push({ json: redact({ auditVersion: 1, at: new Date().toISOString(), runId: item.run.runId, mode: item.run.mode, record: 'domain', domain: label(e.domain), status: e.status, grade: e.grade, previousGrade: e.previousGrade,\n      alertReason: e.alertReason, dataDate: e.dataDate, daysWithData: e.daysWithData || 0,\n      metrics: Object.fromEntries(Object.entries(e.metrics || {}).map(([k, v]) => [k, round(v)])), spamBaseline: round(e.baseline ? e.baseline.spamRate : null),\n      findings: (e.findings || []).map((f) => `${f.grade}:${f.kind}`), compliance: e.compliance ? { needsWorkCount: e.compliance.needsWork.length, deliverability: e.compliance.deliverability } : null,\n      errors: (e.errors || []).map((x) => redactString(x)) }) });\n  }\n}\nif (LOG_TO_STDOUT) for (const r of out) { try { console.log(`[postmaster-watchdog] ${JSON.stringify(r.json)}`); } catch (e) { /* best effort */ } }\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try { const s = $getWorkflowStaticData('global'); if (!Array.isArray(s.postmasterAudit)) s.postmasterAudit = []; s.postmasterAudit.push(...out.map((o) => o.json)); if (s.postmasterAudit.length > RING_SIZE) s.postmasterAudit.splice(0, s.postmasterAudit.length - RING_SIZE); } catch (e) { /* manual runs */ }\n}\nreturn out;\n"
+      },
+      "id": "5b981e3c-8aff-5f33-acd5-5024c5ae4bfd",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        300
+      ],
+      "notes": "Run record + one masked record per domain · stdout + ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "84db6dfd-599a-575a-a9a0-7590659a7349",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        900
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['GOOGLE_OAUTH_CLIENT_SECRET', 'GOOGLE_OAUTH_REFRESH_TOKEN', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_POSTMASTER_API_KEY', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\bya29\\.[A-Za-z0-9_\\-.]{10,}/g, '[REDACTED_GOOGLE_TOKEN]')\n    .replace(/\\b1\\/\\/[A-Za-z0-9_\\-]{20,}/g, '[REDACTED_REFRESH_TOKEN]')\n    .replace(/\\bAIza[0-9A-Za-z_\\-]{30,40}/g, '[REDACTED_API_KEY]')\n    .replace(/\\bGOCSPX-[A-Za-z0-9_\\-]{10,}/g, '[REDACTED_CLIENT_SECRET]')\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig|X-Amz-Signature|Expires)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskPhone = (p) => { const d = String(p || '').replace(/\\D/g, ''); return d.length >= 4 ? `+${d.length > 10 ? d.slice(0, d.length - 10) : ''}•••••${d.slice(-4)}` : null; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'postmaster_watchdog_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[postmaster-watchdog:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Postmaster deliverability watchdog failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Postmaster deliverability watchdog failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · no deliverability check ran; open Postmaster Tools manually until this is fixed` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "6101046e-a1fc-56fe-b4cd-f2078b91685c",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4c19a3ce-bd15-520c-9dd2-bb6467ee8932",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07367a77-5269-5b00-97b5-f0c886b0aa44",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "f42fff48-b986-55b0-a530-bb536a529d13",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        840
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-google-postmaster-tools-deliverability-alert-bot\nDaily Gmail deliverability watchdog: Postmaster Tools API v2 → derived health grade → Slack. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No Google or Slack calls until both are `false`.\n\n**Stage 1** Execute the workflow (pinned fictional run, 7 domains).\n**Stage 2** `SANDBOX_MODE=false`: real Postmaster data, Slack simulated.\n**Stage 3** `DRY_RUN=false`: Slack alerts go live.\n\nGoogle retired Domain/IP Reputation in v2. The grade is derived. See README §5.",
+        "height": 320,
+        "width": 720,
+        "color": 4
+      },
+      "id": "e19d815e-344b-5bd2-a94b-2cad5234b1f2",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Postmaster Tools API v2\nOAuth refresh token → (optional) list domains → domainStats:query + complianceStatus per domain.",
+        "height": 100,
+        "width": 640,
+        "color": 3
+      },
+      "id": "438ca4db-1853-5f8c-a546-bcc4bd7858cf",
+      "name": "Sticky: API",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        680,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or bodies. OAuth tokens, client secrets, API keys and webhook URLs are redacted.",
+        "height": 90,
+        "width": 620,
+        "color": 2
+      },
+      "id": "6cd5e94a-0b90-53d2-849b-2e28a0998f3b",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        780
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Deliverability Check": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Context": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Postmaster?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Postmaster?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Postmaster API (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Google Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Postmaster API (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Domain Health & Alert Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Google Access Token": {
+      "main": [
+        [
+          {
+            "node": "Discover Domains?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discover Domains?": {
+      "main": [
+        [
+          {
+            "node": "List Postmaster Domains",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Domain Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Postmaster Domains": {
+      "main": [
+        [
+          {
+            "node": "Build Domain Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Domain Queries": {
+      "main": [
+        [
+          {
+            "node": "Domains to Check?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Domains to Check?": {
+      "main": [
+        [
+          {
+            "node": "Query Domain Stats",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Domain Health & Alert Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Domain Stats": {
+      "main": [
+        [
+          {
+            "node": "Get Compliance Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Compliance Status": {
+      "main": [
+        [
+          {
+            "node": "Domain Health & Alert Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Domain Health & Alert Evaluator": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Slack Alert (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Record Domain State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Record Domain State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Slack Alert (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Record Domain State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Domain State": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Daily Deliverability Check": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T07:17:00.000+00:00",
+          "Readable date": "November 16th 2026, 7:17:00 am",
+          "Timezone": "UTC",
+          "sandboxFixtures": {
+            "today": "2026-11-16",
+            "domains": [
+              {
+                "name": "mail.acme-fixture.example",
+                "days": [
+                  {
+                    "date": "2026-11-08",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-09",
+                    "metrics": {
+                      "spam_rate": 0.0002,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-10",
+                    "metrics": {
+                      "spam_rate": 0.0004,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-11",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-12",
+                    "metrics": {
+                      "spam_rate": 0.0002,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-13",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-14",
+                    "metrics": {
+                      "spam_rate": 0.0002,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-15",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.004,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  }
+                ],
+                "compliance": {
+                  "domainId": "fixture",
+                  "rowData": [
+                    {
+                      "requirement": "SPF",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DKIM",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_POLICY",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_ALIGNMENT",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "TLS_ENCRYPTION",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "USER_REPORTED_SPAM_RATE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "ONE_CLICK_UNSUBSCRIBE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    }
+                  ],
+                  "deliverabilityStatusVerdict": {
+                    "state": {
+                      "status": "COMPLIANT"
+                    }
+                  }
+                }
+              },
+              {
+                "name": "news.acme-fixture.example",
+                "days": [
+                  {
+                    "date": "2026-11-08",
+                    "metrics": {
+                      "spam_rate": 0.0005,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-09",
+                    "metrics": {
+                      "spam_rate": 0.0004,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-10",
+                    "metrics": {
+                      "spam_rate": 0.0006,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-11",
+                    "metrics": {
+                      "spam_rate": 0.0005,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-12",
+                    "metrics": {
+                      "spam_rate": 0.0005,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-13",
+                    "metrics": {
+                      "spam_rate": 0.0004,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-14",
+                    "metrics": {
+                      "spam_rate": 0.0006,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-15",
+                    "metrics": {
+                      "spam_rate": 0.0014,
+                      "err_total": 0.006,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.003,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  }
+                ],
+                "compliance": {
+                  "domainId": "fixture",
+                  "rowData": [
+                    {
+                      "requirement": "SPF",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DKIM",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_POLICY",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_ALIGNMENT",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "TLS_ENCRYPTION",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "USER_REPORTED_SPAM_RATE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "ONE_CLICK_UNSUBSCRIBE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    }
+                  ],
+                  "deliverabilityStatusVerdict": {
+                    "state": {
+                      "status": "COMPLIANT"
+                    }
+                  }
+                }
+              },
+              {
+                "name": "outbound.globex-fixture.example",
+                "days": [
+                  {
+                    "date": "2026-11-08",
+                    "metrics": {
+                      "spam_rate": 0.0016,
+                      "err_total": 0.01,
+                      "err_rep_domain": 0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-09",
+                    "metrics": {
+                      "spam_rate": 0.0018,
+                      "err_total": 0.012,
+                      "err_rep_domain": 0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-10",
+                    "metrics": {
+                      "spam_rate": 0.0021,
+                      "err_total": 0.015,
+                      "err_rep_domain": 0.002,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-11",
+                    "metrics": {
+                      "spam_rate": 0.0024,
+                      "err_total": 0.018,
+                      "err_rep_domain": 0.004,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-12",
+                    "metrics": {
+                      "spam_rate": 0.0027,
+                      "err_total": 0.022,
+                      "err_rep_domain": 0.008,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-13",
+                    "metrics": {
+                      "spam_rate": 0.003,
+                      "err_total": 0.026,
+                      "err_rep_domain": 0.012,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-14",
+                    "metrics": {
+                      "spam_rate": 0.0033,
+                      "err_total": 0.03,
+                      "err_rep_domain": 0.016,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  },
+                  {
+                    "date": "2026-11-15",
+                    "metrics": {
+                      "spam_rate": 0.0038,
+                      "err_total": 0.034,
+                      "err_rep_domain": 0.021,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.008,
+                      "auth_spf": 0.995,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.91,
+                      "tls_inbound": 0.962
+                    }
+                  }
+                ],
+                "compliance": {
+                  "domainId": "fixture",
+                  "rowData": [
+                    {
+                      "requirement": "SPF",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DKIM",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_ALIGNMENT",
+                      "status": {
+                        "status": "NEEDS_WORK"
+                      }
+                    },
+                    {
+                      "requirement": "USER_REPORTED_SPAM_RATE",
+                      "status": {
+                        "status": "NEEDS_WORK"
+                      }
+                    },
+                    {
+                      "requirement": "TLS_ENCRYPTION",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    }
+                  ],
+                  "deliverabilityStatusVerdict": {
+                    "state": {
+                      "status": "NEEDS_WORK"
+                    },
+                    "reason": "HIGH_SPAM_RATE"
+                  }
+                }
+              },
+              {
+                "name": "promo.initech-fixture.example",
+                "days": [
+                  {
+                    "date": "2026-11-08",
+                    "metrics": {
+                      "spam_rate": 0.0009,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-09",
+                    "metrics": {
+                      "spam_rate": 0.0008,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-10",
+                    "metrics": {
+                      "spam_rate": 0.0006,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-11",
+                    "metrics": {
+                      "spam_rate": 0.0005,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-12",
+                    "metrics": {
+                      "spam_rate": 0.0004,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-13",
+                    "metrics": {
+                      "spam_rate": 0.0004,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-14",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  },
+                  {
+                    "date": "2026-11-15",
+                    "metrics": {
+                      "spam_rate": 0.0003,
+                      "err_total": 0.005,
+                      "err_rep_domain": 0.0,
+                      "err_rep_ip": 0.0,
+                      "err_temp": 0.002,
+                      "auth_spf": 0.999,
+                      "auth_dkim": 0.998,
+                      "auth_dmarc": 0.997,
+                      "tls_inbound": 1.0
+                    }
+                  }
+                ],
+                "compliance": {
+                  "domainId": "fixture",
+                  "rowData": [
+                    {
+                      "requirement": "SPF",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DKIM",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_POLICY",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "DMARC_ALIGNMENT",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "TLS_ENCRYPTION",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "USER_REPORTED_SPAM_RATE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    },
+                    {
+                      "requirement": "ONE_CLICK_UNSUBSCRIBE",
+                      "status": {
+                        "status": "COMPLIANT"
+                      }
+                    }
+                  ],
+                  "deliverabilityStatusVerdict": {
+                    "state": {
+                      "status": "COMPLIANT"
+                    }
+                  }
+                }
+              },
+              {
+                "name": "tiny.umbrella-fixture.example",
+                "days": [],
+                "compliance": null
+              },
+              {
+                "name": "legacy.hooli-fixture.example",
+                "error": 403
+              },
+              {
+                "name": "bulk.stark-fixture.example",
+                "days": [
+                  {
+                    "date": "2026-11-08",
+                    "metrics": {
+                      "spam_rate": 0.0069,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-09",
+                    "metrics": {
+                      "spam_rate": 0.0072,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-10",
+                    "metrics": {
+                      "spam_rate": 0.007,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-11",
+                    "metrics": {
+                      "spam_rate": 0.0068,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-12",
+                    "metrics": {
+                      "spam_rate": 0.0073,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-13",
+                    "metrics": {
+                      "spam_rate": 0.0071,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-14",
+                    "metrics": {
+                      "spam_rate": 0.007,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  },
+                  {
+                    "date": "2026-11-15",
+                    "metrics": {
+                      "spam_rate": 0.0071,
+                      "err_total": 0.09,
+                      "err_rep_domain": 0.03,
+                      "err_rep_ip": 0.06,
+                      "err_temp": 0.01,
+                      "auth_spf": 0.99,
+                      "auth_dkim": 0.99,
+                      "auth_dmarc": 0.985,
+                      "tls_inbound": 0.995
+                    }
+                  }
+                ],
+                "compliance": {
+                  "domainId": "fixture",
+                  "rowData": [
+                    {
+                      "requirement": "USER_REPORTED_SPAM_RATE",
+                      "status": {
+                        "status": "NEEDS_WORK"
+                      }
+                    }
+                  ],
+                  "deliverabilityStatusVerdict": {
+                    "state": {
+                      "status": "NEEDS_WORK"
+                    },
+                    "reason": "HIGH_SPAM_RATE"
+                  }
+                }
+              }
+            ],
+            "previousState": {
+              "mail.acme-fixture.example": {
+                "grade": "HIGH",
+                "checkedAt": "2026-11-15T07:17:00.000Z",
+                "lastAlertAt": null
+              },
+              "news.acme-fixture.example": {
+                "grade": "HIGH",
+                "checkedAt": "2026-11-15T07:17:00.000Z",
+                "lastAlertAt": null
+              },
+              "outbound.globex-fixture.example": {
+                "grade": "MEDIUM",
+                "checkedAt": "2026-11-15T07:17:00.000Z",
+                "lastAlertAt": "2026-11-14T07:17:00.000Z"
+              },
+              "promo.initech-fixture.example": {
+                "grade": "LOW",
+                "checkedAt": "2026-11-15T07:17:00.000Z",
+                "lastAlertAt": "2026-11-13T07:17:00.000Z"
+              },
+              "bulk.stark-fixture.example": {
+                "grade": "BAD",
+                "checkedAt": "2026-11-15T07:17:00.000Z",
+                "lastAlertAt": "2026-11-15T07:17:00.000Z"
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
