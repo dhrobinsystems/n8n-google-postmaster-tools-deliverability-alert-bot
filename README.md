@@ -42,6 +42,8 @@ Gmail deliverability problems rarely arrive without warning. Spam complaints cre
 
 ## 2. Architecture
 
+![Workflow Overview](workflow-overview.png)
+
 ```mermaid
 flowchart TD
     A[Daily Deliverability Check<br/>Schedule Trigger · cron] --> B[Build Run Context<br/>domains · lookback window · mode]
